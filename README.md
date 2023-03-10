@@ -11,5 +11,4 @@ of our Dockerfiles in a single place.
 - Image specific resources
     - [Julia Baked](julia-baked/README.md)
     - [Julia GitLab CI](julia-gitlab-ci/README.md)
-    - [EIS](https://gitlab.invenia.ca/invenia/eis/docker/README.md)
-- [Background](https://gitlab.invenia.ca/invenia/replatforming/blob/master/feature-specs/deployment.md)
+    
