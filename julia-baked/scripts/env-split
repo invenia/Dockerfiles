@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Provides support to `#!` (shebang) lines which include arguments. Emulates the behaviour of
+# `/usr/bin/env -S` from coreutils 8.30 (https://www.freebsd.org/cgi/man.cgi?env).
+#
+# If a script named "hello.jl" had the shebang line:
+#
+#     #!/root/env-split julia -e 'include(popfirst!(ARGS))'
+#
+# and the script was run via `./hello.jl world` then the arguments given to `env-split` would be:
+#
+#     arg[0] = "julia -e 'include(popfirst!(ARGS))'"
+#     arg[1] = "./hello.jl"
+#     arg[2] = "world"
+#
+
+IFS=$'\n' shebang=( $(xargs printf '%s\n' <<<$1) )
+shift
+exec "${shebang[@]}" "$@"

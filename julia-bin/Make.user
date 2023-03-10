@@ -1,0 +1,44 @@
+# For compatibility we should target the oldest AWS CPU architecture which currently
+# appears to be "Haswell" (https://aws.amazon.com/ec2/instance-types/).
+#
+# Normally this Docker image is being run on AWS Batch compute environments for which we
+# usually typically use "optimal" instance types (from the latest C, M, and R instance familes)
+# (https://docs.aws.amazon.com/batch/latest/userguide/create-compute-environment.html).
+# - M5: Intel Xeon® Platinum 8175 with AXV-512 (Skylake)
+# - M4: Intel Xeon® E5-2686 v4 (Broadwell) / Intel Xeon® E5-2676 v3 (Haswell)
+# - C5: Intel Xeon Platinum processors with AVX-512 (Skylake)
+# - C4: Intel Xeon E5-2666 v3 (Haswell)
+# - R4: Intel Xeon E5-2686 v4 (Broadwell)
+#
+# Since the Intel CPU archs seem to be only add new features with each generation we should be safe
+# to use code targeting older architectures on future generations. Note using the
+# architecture names requires using GCC 4.9+.
+# https://gcc.gnu.org/onlinedocs/gcc-4.8.3/gcc/i386-and-x86-64-Options.html
+# https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/i386-and-x86-64-Options.html
+#
+# Note: MTUNE appears to be ignored by FFTW
+# Note: MARCH will be appended automatically at runtime to support multi-arch containers
+
+# Compatible with Haswell and newer ("haswell" on GCC 4.9+)
+# MARCH=core-avx2
+
+# For compatibility with the AWS Graviton2 CPU architecture we'll use ARMv8.2
+#
+# - a1:
+#     CPU Platform Graviton
+#     Architecture: ARMv8.0 (march=armv8-a, GCC 4.9+)
+# - m6g / c6g / r6g:
+#     CPU Platform: Graviton2
+#     Micro-Architecture: Neoverse N1
+#     Architecture: ARMv8.2 (march=armv8.2-a, GCC 7.5+)
+#
+# Graviton:
+# - https://perspectives.mvdirona.com/2018/11/aws-designed-processor-graviton/#comment-686022
+# - https://en.wikichip.org/wiki/annapurna_labs/alpine/al73400
+#
+# Graviton2:
+# - https://www.anandtech.com/show/15578/cloud-clash-amazon-graviton2-arm-against-intel-and-amd
+#
+# MARCH:
+# - https://gcc.gnu.org/onlinedocs/gcc-10.2.0/gcc/AArch64-Options.html#AArch64-Options
+# MARCH=armv8.2-a

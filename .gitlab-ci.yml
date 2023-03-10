@@ -1,0 +1,484 @@
+---
+include:
+  - project: invenia/gitlab-ci-helper
+    file: /templates/ci-init.yml
+
+stages:
+  - "julia-bin (build)"
+  - "julia-bin (manifest)"
+  - "julia-baked (build)"
+  - "julia-baked (manifest)"
+  - "julia-gitlab-ci (build)"
+  - "julia-gitlab-ci (manifest)"
+
+variables:
+  LANG: en_CA.UTF-8
+  AWS_DEFAULT_REGION: us-east-1
+  ACCOUNT_ID: 111111111111
+  OPS_ACCOUNT_ID: 111111111111
+  MORPH_ROLE: arn:aws:iam::${ACCOUNT_ID}:role/Morph
+  OPS_ROLE: arn:aws:iam::${OPS_ACCOUNT_ID}:role/CI
+  ECR_HOST: ${OPS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+  # Force Docker authentication to be isolated to a pipeline
+  DOCKER_CONFIG: $CI_PROJECT_DIR/.docker
+
+.docker_setup: &docker_setup
+  # Resolve supported VERSION formats as much as we can:
+  # - MAJOR.MINOR.PATCH
+  # - MAJOR.MINOR (will find latest patch that matches)
+  # - nightly
+  |
+  function julia_tags {
+      git ls-remote --tags https://github.com/JuliaLang/julia | sed 's/.*\///; /\^{}/d'
+  }
+
+  function latest() {
+      local tags
+      local tag
+
+      tags=$(cat -)
+
+      function _latest() {
+          cat - | sort -V | tail -n 1
+      }
+
+      tag=$(echo "$tags" | sed '/-/d' | _latest)  # latest final release
+      if [ -z "$tag" ]; then
+          tag=$(echo "$tags" | sed '/-/!d' | _latest)  # latest pre-release
+          [ -z "$tag" ] && return 1
+      fi
+
+      echo $tag
+  }
+
+  function latest_julia() {
+      local partial_ver=$1  # Expects version number without `v` prefix
+      local binary_released=${2:-true}  # "true" or "false"
+
+      local tags
+      local tag
+      local version
+      local url
+      local status
+
+      tags=$(julia_tags | (grep "^v$partial_ver" || :))
+
+      while [ -n "$tags" ]; do
+          tag=$(echo "$tags" | latest)
+          version=$(echo "$tag" | sed 's/^v//')
+
+          if [ "$binary_released" == "true" ]; then
+              url="https://julialang-s3.julialang.org/bin/linux/x64/${version%\.*}/julia-${version}-linux-x86_64.tar.gz"
+
+              # Validate the tag has an associated binary release
+              status=$(curl --head -sLw '%{http_code}\n' $url -o /dev/null)
+              echo "status=$status $url" >&2
+              if [ $status -eq 200 ]; then  # Binary release exists
+                  echo $version
+                  return 0
+              elif [ $status -eq 404 ]; then  # Binary release missing
+                  # Remove the latest tag which does not have an associated binary release
+                  # and perform the validation again.
+                  # Note: Since `$tag` is not escaped in the regex this could remove more than we intend
+                  tags=$(echo "$tags" | sed "/^$tag\$/d")
+              else
+                  # The server returned an unexpected response and we should abend to bring
+                  # this to the attention of the pipeline executor.
+                  echo "Unexpected HTTP response $status when performing HEAD request to: $url" >&2
+                  return 2
+              fi
+          else
+              echo $version
+              return 0
+          fi
+      done
+
+      return 1
+  }
+
+  # Generate a list of images based upon a manifest image name a list of architectures
+  function architecture_images() {
+      local image="$1"
+      shift
+
+      for arch in $@; do
+          echo "${image}-${arch}"
+      done
+  }
+
+  function gen_manifest() {
+      local manifest=$1
+      shift
+      local images=$@
+
+      docker manifest create $manifest ${images[@]}
+
+      for image in ${images[@]}; do
+          if [[ $image == *-aarch64 ]]; then
+              docker manifest annotate --variant v8 $manifest $image
+          fi
+      done
+
+      docker manifest inspect $manifest
+      docker manifest push $manifest
+  }
+
+  if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]$ ]]; then
+      SHORT_VERSION=${VERSION%.*}
+  elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+      full_version=$(latest_julia $VERSION $BINARY_BUILD)
+
+      if [[ -n "$full_version" ]]; then
+          SHORT_VERSION=$VERSION
+          VERSION=$full_version
+      else
+          echo "Unable to determine latest version of \"$VERSION\"" >&2
+          exit 1
+      fi
+  fi
+
+  ARCH=$(uname --hardware-platform)
+  case "$ARCH" in \
+      x86_64) PLATFORM=linux/amd64;;
+      aarch64) PLATFORM=linux/arm64/v8;;
+      i386) PLATFORM=linux/386;;
+      *) echo "error: current architecture ($ARCH) does not have a specified Docker platform" >&2; exit 1 ;;
+  esac
+
+  # Create and display variables including: Docker image, Docker tags, and architecture
+  set -x
+  IMAGE="$ECR_HOST/$IMAGE_NAME"
+  VERSION=$VERSION
+  SHORT_VERSION=$SHORT_VERSION
+  BRANCH_TAG=${VERSION}-${CI_COMMIT_REF_SLUG}
+  SHA_TAG=${VERSION}-${CI_COMMIT_SHA}
+  ARCH=$ARCH
+  PLATFORM=$PLATFORM
+  set +x
+
+.docker_before_script:
+  before_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - refresh_pkgs
+    - install_private_pypi_creds
+    - enter_python_venv
+    - install_awscli
+    - docker --version
+    - aws --version
+    - install_cloudspy
+    - cloudspy --version
+    - export AWS_SHARED_CREDENTIALS_FILE="$PWD/tmp-creds"
+    - aws-credentials --role-arn=$MORPH_ROLE --role-session-name=Morph --credentials-file=$AWS_SHARED_CREDENTIALS_FILE  # Assume the morph role
+
+.julia_docker_build:
+  script:
+    - *docker_setup
+    - |
+      if [[ ${CI_COMMIT_REF_SLUG} == "master" ]] || [[ "${CI_COMMIT_MESSAGE}" =~ \[no-cache\] ]]; then
+          OPTIONS="$OPTIONS --no-cache"
+      else
+          OPTIONS="$OPTIONS --cache-from $IMAGE:$BRANCH_TAG-$ARCH"
+      fi
+
+      if [[ -n "$BASE_IMAGE_NAME" ]]; then
+          BASE_IMAGE="$ECR_HOST/$BASE_IMAGE_NAME"
+          # Use SHA tag ensure to that pipelines use the correct base image on re-run
+          OPTIONS="$OPTIONS --build-arg BASE_IMAGE=$BASE_IMAGE:$SHA_TAG-$ARCH"
+      fi
+
+      # Specify the Julia version to build with
+      if [[ $IMAGE_NAME =~ ^julia-src|julia-bin$ ]]; then
+          OPTIONS="$OPTIONS --build-arg JULIA_VERSION=$VERSION"
+      fi
+
+    - aws-credentials --role-arn=$OPS_ROLE --role-session-name=Ops --credentials-file=$AWS_SHARED_CREDENTIALS_FILE --profile=Morph       # Assume the ci operations role
+    - eval $(aws-exports --profile=Ops)
+    - aws ecr get-login --no-include-email --registry-ids $OPS_ACCOUNT_ID | eval $SHELL
+    # Note: When the CI runs on a branch for the first time there won't be any image to pull
+    - docker pull $IMAGE:$BRANCH_TAG-$ARCH || true
+    - echo $OPTIONS
+    - docker build $OPTIONS -t $IMAGE:$BRANCH_TAG-$ARCH -t $IMAGE:$SHA_TAG-$ARCH $IMAGE_NAME/
+    - docker push $IMAGE:$BRANCH_TAG-$ARCH
+    - docker push $IMAGE:$SHA_TAG-$ARCH
+  after_script:
+    - *docker_setup
+    - '[ -n "$BASE_IMAGE_NAME" ] && docker rmi $BASE_IMAGE_NAME:$SHA_TAG-$ARCH'
+    - docker rmi $IMAGE:$BRANCH_TAG-$ARCH $IMAGE:$SHA_TAG-$ARCH
+  extends: .docker_before_script
+
+
+.docker_manifest:
+  script:
+    - *docker_setup
+    # Determine images to be included in the manifests.
+    # Note ultimately the internal Docker image SHA256 is used in the manifests so it doesn't matter if we use the $SHA_TAG or $BRANCH_TAG
+    - IFS=', ' read -r -a archs <<< "$ARCHS"
+    - images=($(architecture_images $IMAGE:$SHA_TAG ${archs[@]}))
+    # Log into the Operations Account ECR
+    - aws-credentials --role-arn=$OPS_ROLE --role-session-name=Ops --credentials-file=$AWS_SHARED_CREDENTIALS_FILE --profile=Morph       # Assume the ci operations role
+    - eval $(aws-exports --profile=Ops)
+    - aws ecr get-login --no-include-email --registry-ids $OPS_ACCOUNT_ID | eval $SHELL
+    # Create and push the manifests
+    - export DOCKER_CLI_EXPERIMENTAL=enabled
+    - gen_manifest $IMAGE:$BRANCH_TAG ${images[@]}
+    - gen_manifest $IMAGE:$SHA_TAG ${images[@]}
+    - |
+      if [[ ${CI_COMMIT_REF_SLUG} == "master" ]]; then
+          gen_manifest $IMAGE:$VERSION ${images[@]}
+
+          if [[ -n "$SHORT_VERSION" ]]; then
+              gen_manifest $IMAGE:$SHORT_VERSION ${images[@]}
+          fi
+      fi
+  extends: .docker_before_script
+
+
+.x86_64:
+  tags:
+    - amzn2
+    - x86_64
+    - docker-build
+    - ci-account
+
+.aarch64:
+  tags:
+    - amzn2
+    - aarch64
+    - docker-build
+    - ci-account
+
+# Only run these jobs if any of the following are true:
+# - The branch is "master"
+# - The commit message contains "[all]" or "[all versions]"
+# - The environmental variable `ALL=true` (useful for triggered pipelines)
+.restricted:
+  only:
+    variables:
+      - $CI_COMMIT_REF_SLUG == "master"
+      - $CI_COMMIT_MESSAGE =~ /\[all( versions)?\]/
+      - $ALL == "true"
+
+.julia-bin:
+  stage: "julia-bin (build)"
+  variables:
+    IMAGE_NAME: "julia-bin"
+  extends: .julia_docker_build
+
+.julia-bin-manifest:
+  stage: "julia-bin (manifest)"
+  tags:
+    - amzn2
+    - docker-build
+  variables:
+    IMAGE_NAME: "julia-bin"
+    ARCHS: "x86_64, aarch64"
+  extends: .docker_manifest
+
+.julia-baked:
+  stage: "julia-baked (build)"
+  variables:
+    BASE_IMAGE_NAME: "julia-bin"
+    IMAGE_NAME: "julia-baked"
+  extends: .julia_docker_build
+
+.julia-baked-manifest:
+  stage: "julia-baked (manifest)"
+  tags:
+    - amzn2
+    - docker-build
+  variables:
+    IMAGE_NAME: "julia-baked"
+    ARCHS: "x86_64, aarch64"
+  extends: .docker_manifest
+
+.julia-gitlab-ci:
+  stage: "julia-gitlab-ci (build)"
+  variables:
+    BASE_IMAGE_NAME: "julia-baked"
+    IMAGE_NAME: "julia-gitlab-ci"
+  extends: .julia_docker_build
+
+.julia-gitlab-ci-manifest:
+  stage: "julia-gitlab-ci (manifest)"
+  tags:
+    - amzn2
+    - docker-build
+  variables:
+    IMAGE_NAME: "julia-gitlab-ci"
+    ARCHS: "x86_64, aarch64"
+  extends: .docker_manifest
+
+.1_7:
+  variables:
+    VERSION: "1.7"
+  extends: .restricted
+
+.1_6:
+  variables:
+    VERSION: "1.6"
+
+.1_8:
+  variables:
+    VERSION: "1.8"
+  extends: .restricted
+
+.nightly:
+  variables:
+    VERSION: "nightly"
+  extends: .restricted
+
+
+### julia-bin (build) ###
+
+"julia-bin (1.7, x86_64)":
+  extends: [.julia-bin, .1_7, .x86_64]
+
+"julia-bin (1.7, aarch64)":
+  extends: [.julia-bin, .1_7, .aarch64]
+
+"julia-bin (1.6, x86_64)":
+  extends: [.julia-bin, .1_6, .x86_64]
+
+"julia-bin (1.6, aarch64)":
+  extends: [.julia-bin, .1_6, .aarch64]
+
+"julia-bin (1.8, x86_64)":
+  extends: [.julia-bin, .1_8, .x86_64]
+
+"julia-bin (1.8, aarch64)":
+  extends: [.julia-bin, .1_8, .aarch64]
+
+"julia-bin (nightly, x86_64)":
+  extends: [.julia-bin, .nightly, .x86_64]
+  when: manual
+
+"julia-bin (nightly, aarch64)":
+  extends: [.julia-bin, .nightly, .aarch64]
+  when: manual
+
+
+### julia-bin (manifest) ###
+
+"julia-bin (1.7)":
+  needs: ["julia-bin (1.7, x86_64)", "julia-bin (1.7, aarch64)"]
+  extends: [.julia-bin-manifest, .1_7]
+
+"julia-bin (1.6)":
+  needs: ["julia-bin (1.6, x86_64)", "julia-bin (1.6, aarch64)"]
+  extends: [.julia-bin-manifest, .1_6]
+
+"julia-bin (1.8)":
+  needs: ["julia-bin (1.8, x86_64)", "julia-bin (1.8, aarch64)"]
+  extends: [.julia-bin-manifest, .1_8]
+
+"julia-bin (nightly)":
+  needs: ["julia-bin (nightly, x86_64)", "julia-bin (nightly, aarch64)"]
+  extends: [.julia-bin-manifest, .nightly]
+
+
+### julia-baked (build) ###
+
+"julia-baked (1.7, x86_64)":
+  needs: ["julia-bin (1.7, x86_64)"]
+  extends: [.julia-baked, .1_7, .x86_64]
+
+"julia-baked (1.7, aarch64)":
+  needs: ["julia-bin (1.7, aarch64)"]
+  extends: [.julia-baked, .1_7, .aarch64]
+
+"julia-baked (1.6, x86_64)":
+  needs: ["julia-bin (1.6, x86_64)"]
+  extends: [.julia-baked, .1_6, .x86_64]
+
+"julia-baked (1.6, aarch64)":
+  needs: ["julia-bin (1.6, aarch64)"]
+  extends: [.julia-baked, .1_6, .aarch64]
+
+"julia-baked (1.8, x86_64)":
+  needs: ["julia-bin (1.8, x86_64)"]
+  extends: [.julia-baked, .1_8, .x86_64]
+
+"julia-baked (1.8, aarch64)":
+  needs: ["julia-bin (1.8, aarch64)"]
+  extends: [.julia-baked, .1_8, .aarch64]
+
+"julia-baked (nightly, x86_64)":
+  needs: ["julia-bin (nightly, x86_64)"]
+  extends: [.julia-baked, .nightly, .x86_64]
+
+"julia-baked (nightly, aarch64)":
+  needs: ["julia-bin (nightly, aarch64)"]
+  extends: [.julia-baked, .nightly, .aarch64]
+
+
+### julia-baked (manifest) ###
+
+"julia-baked (1.7)":
+  needs: ["julia-baked (1.7, x86_64)", "julia-baked (1.7, aarch64)"]
+  extends: [.julia-baked-manifest, .1_7]
+
+"julia-baked (1.6)":
+  needs: ["julia-baked (1.6, x86_64)", "julia-baked (1.6, aarch64)"]
+  extends: [.julia-baked-manifest, .1_6]
+
+"julia-baked (1.8)":
+  needs: ["julia-baked (1.8, x86_64)", "julia-baked (1.8, aarch64)"]
+  extends: [.julia-baked-manifest, .1_8]
+
+"julia-baked (nightly)":
+  needs: ["julia-baked (nightly, x86_64)", "julia-baked (nightly, aarch64)"]
+  extends: [.julia-baked-manifest, .nightly]
+
+
+### julia-gitlab-ci (build) ###
+
+"julia-gitlab-ci (1.7, x86_64)":
+  needs: ["julia-baked (1.7, x86_64)"]
+  extends: [.julia-gitlab-ci, .1_7, .x86_64]
+
+"julia-gitlab-ci (1.7, aarch64)":
+  needs: ["julia-baked (1.7, aarch64)"]
+  extends: [.julia-gitlab-ci, .1_7, .aarch64]
+
+"julia-gitlab-ci (1.6, x86_64)":
+  needs: ["julia-baked (1.6, x86_64)"]
+  extends: [.julia-gitlab-ci, .1_6, .x86_64]
+
+"julia-gitlab-ci (1.6, aarch64)":
+  needs: ["julia-baked (1.6, aarch64)"]
+  extends: [.julia-gitlab-ci, .1_6, .aarch64]
+
+"julia-gitlab-ci (1.8, x86_64)":
+  needs: ["julia-baked (1.8, x86_64)"]
+  extends: [.julia-gitlab-ci, .1_8, .x86_64]
+
+"julia-gitlab-ci (1.8, aarch64)":
+  needs: ["julia-baked (1.8, aarch64)"]
+  extends: [.julia-gitlab-ci, .1_8, .aarch64]
+
+"julia-gitlab-ci (nightly, x86_64)":
+  needs: ["julia-baked (nightly, x86_64)"]
+  extends: [.julia-gitlab-ci, .nightly, .x86_64]
+
+"julia-gitlab-ci (nightly, aarch64)":
+  needs: ["julia-baked (nightly, aarch64)"]
+  extends: [.julia-gitlab-ci, .nightly, .aarch64]
+
+
+### julia-gitlab-ci (manifest) ###
+
+"julia-gitlab-ci (1.7)":
+  needs: ["julia-gitlab-ci (1.7, x86_64)", "julia-gitlab-ci (1.7, aarch64)"]
+  extends: [.julia-gitlab-ci-manifest, .1_7]
+
+"julia-gitlab-ci (1.6)":
+  needs: ["julia-gitlab-ci (1.6, x86_64)", "julia-gitlab-ci (1.6, aarch64)"]
+  extends: [.julia-gitlab-ci-manifest, .1_6]
+
+"julia-gitlab-ci (1.8)":
+  needs: ["julia-gitlab-ci (1.8, x86_64)", "julia-gitlab-ci (1.8, aarch64)"]
+  extends: [.julia-gitlab-ci-manifest, .1_8]
+
+"julia-gitlab-ci (nightly)":
+  needs: ["julia-gitlab-ci (nightly, x86_64)", "julia-gitlab-ci (nightly, aarch64)"]
+  extends: [.julia-gitlab-ci-manifest, .nightly]

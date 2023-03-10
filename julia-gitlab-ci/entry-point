@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# Define the name of the Julia package we are testing as an environmental variable
+if [ ! -z "$CI_PROJECT_DIR" ]; then
+    export PKG_NAME=$(basename ${CI_PROJECT_DIR/%.jl/})
+fi
+
+# Display Julia version information
+if [ "$CI" == "true" ]; then
+    julia --history-file=no -e 'using InteractiveUtils; versioninfo()'
+fi
+
+exec "$@"

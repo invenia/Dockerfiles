@@ -1,0 +1,41 @@
+#!/usr/bin/env julia
+
+if !(1 <= length(ARGS) <= 2)
+    println(stderr, "Usage: julia-coverage <pkg_dir> [<coverage_dir>]")
+    exit(1)
+end
+
+# Use absolute paths as the relative paths may not correct when inside the `cd` do-block
+pkg_dir = abspath(ARGS[1])
+coverage_dir = abspath(length(ARGS) == 2 ? ARGS[2] : "$(ENV["CI_JOB_NAME"]) coverage")
+
+using Pkg
+
+# Install Coverage if not already installed. Note that we are avoiding installing Coverage
+# earlier (either with the Dockerfile or REQUIRE) as we want the tests to execute as quickly
+# as possible without having Coverage or its prerequisites slowing things down.
+# https://gitlab.invenia.ca/invenia/Dockerfiles/merge_requests/30/diffs#note_32313
+Pkg.add("Coverage")
+Pkg.add("Printf")
+
+using Coverage
+using Printf
+
+println("Processing coverage")
+cd(pkg_dir) do
+    mkpath(joinpath(coverage_dir, "html"))
+    cov = process_folder()
+    c, t = get_summary(cov)
+    @printf("Test Coverage %.2f%%\n", t == 0 ? 0 : c/t * 100)
+    LCOV.writefile(joinpath(coverage_dir, "coverage.info"), cov)
+    cp("src/", joinpath(coverage_dir, "html", "src"))
+    print(read(`genhtml --version`, String))
+
+    try
+        run(`genhtml -o $(joinpath(coverage_dir, "html")) --prefix $(pwd()) $(joinpath(coverage_dir, "coverage.info"))`)
+    catch
+        println("Coverage analysis failed")
+    end
+    # Copy over all the coverage files while still maintaining the directory structure.
+    run(`rsync -r --include='*.cov' --include '*.mem' --include='*/' --exclude='*' src/ $(joinpath(coverage_dir, "raw"))`)
+end
